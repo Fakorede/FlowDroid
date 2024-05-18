@@ -3,11 +3,7 @@ package soot.jimple.infoflow.cmd;
 import java.io.File;
 import java.io.FilenameFilter;
 import java.io.IOException;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -18,6 +14,9 @@ import org.apache.commons.cli.ParseException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.xmlpull.v1.XmlPullParserException;
+import soot.*;
+import soot.jimple.infoflow.InfoflowConfiguration;
 import soot.jimple.infoflow.InfoflowConfiguration.AliasingAlgorithm;
 import soot.jimple.infoflow.InfoflowConfiguration.CallbackSourceMode;
 import soot.jimple.infoflow.InfoflowConfiguration.CallgraphAlgorithm;
@@ -33,19 +32,26 @@ import soot.jimple.infoflow.android.InfoflowAndroidConfiguration;
 import soot.jimple.infoflow.android.InfoflowAndroidConfiguration.CallbackAnalyzer;
 import soot.jimple.infoflow.android.SetupApplication;
 import soot.jimple.infoflow.android.config.XMLConfigurationParser;
+import soot.jimple.infoflow.android.manifest.ProcessManifest;
 import soot.jimple.infoflow.methodSummary.data.provider.LazySummaryProvider;
 import soot.jimple.infoflow.methodSummary.taintWrappers.ReportMissingSummaryWrapper;
 import soot.jimple.infoflow.methodSummary.taintWrappers.SummaryTaintWrapper;
 import soot.jimple.infoflow.methodSummary.taintWrappers.TaintWrapperFactory;
+import soot.jimple.infoflow.solver.cfg.InfoflowCFG;
 import soot.jimple.infoflow.taintWrappers.EasyTaintWrapper;
 import soot.jimple.infoflow.taintWrappers.ITaintPropagationWrapper;
 import soot.jimple.infoflow.taintWrappers.TaintWrapperSet;
+import soot.jimple.toolkits.callgraph.CallGraph;
+import soot.jimple.toolkits.callgraph.Edge;
+import soot.jimple.toolkits.ide.icfg.BackwardsInterproceduralCFG;
+import soot.jimple.toolkits.ide.icfg.JimpleBasedInterproceduralCFG;
+import soot.toolkits.graph.DirectedGraph;
 import soot.util.HashMultiMap;
 import soot.util.MultiMap;
 
 /**
  * Main class for running FlowDroid from the command-line
- * 
+ *
  * @author Steven Arzt
  *
  */
@@ -321,10 +327,6 @@ public class MainClass {
 					outputFile.mkdirs();
 			}
 
-			// Initialize the taint wrapper. We only do this once for all apps to cache
-			// summaries that we have already loaded.
-			ITaintPropagationWrapper taintWrapper = initializeTaintWrapper(cmd);
-
 			int curAppIdx = 1;
 			for (File apkFile : apksToAnalyze) {
 				if (filesToSkip.contains(apkFile.getName())) {
@@ -350,18 +352,125 @@ public class MainClass {
 					}
 				}
 
-				// Create the data flow analyzer
-				analyzer = createFlowDroidInstance(config);
-				analyzer.setTaintWrapper(taintWrapper);
+//				if (config.getSootIntegrationMode() == InfoflowAndroidConfiguration.SootIntegrationMode.CreateNewInstance) {
+//					G.reset();
+//				}
 
-				// Start the data flow analysis
-				analyzer.runInfoflow();
+				// Generate call graph
+				if (true){
+					System.out.println("Lets try generating the call graph...");
+					System.out.println("=============================================");
 
-				if (reportMissingSummaryWrapper != null) {
-					String file = cmd.getOptionValue(OPTION_MISSING_SUMMARIES_FILE);
-					reportMissingSummaryWrapper.writeResults(new File(file));
+					analyzer = createFlowDroidInstance(config);
+
+					analyzer.constructCallgraph();
+
+					CallGraph cg = Scene.v().getCallGraph();
+
+					System.out.println(cg);
+
+					// Iterate over the callgraph
+					if (false) {
+						for (Edge edge : cg) {
+							SootMethod smSrc = edge.src();
+							Unit uSrc = edge.srcStmt();
+							SootMethod smDest = edge.tgt();
+							System.out.println("Edge from " + uSrc + " in " + smSrc + " to " + smDest);
+						}
+					}
 				}
-			}
+
+				// Generate the ICFG
+				System.out.println("Now, lets try generating the ICFG...");
+				System.out.println("=============================================");
+
+				if (true) {
+					System.out.println("Using method 1");
+					List<SootClass> validClasses = new ArrayList<>();
+					String apkPath = cmd.getOptionValue(OPTION_APK_FILE);
+					String appPackageName = getPackageName(apkPath);
+
+					for (SootClass sootClass : Scene.v().getApplicationClasses()) {
+						if (!sootClass.getName().contains(appPackageName))
+							continue;
+						if (sootClass.getName().contains(appPackageName + ".R") || sootClass.getName().contains(appPackageName + ".BuildConfig"))
+							continue;
+						validClasses.add(sootClass);
+					}
+
+					System.out.println("Valid classes detected by Soot: " + validClasses.toArray().length);
+
+					InfoflowCFG icfg = new InfoflowCFG();
+					int classIndex = 0;
+
+					for (SootClass sootClass : validClasses) {
+						System.out.printf("*****Class %d: %s*****%n", ++classIndex, sootClass.getName());
+
+						if (sootClass.getMethods().isEmpty()) {
+							System.out.println("No methods detected by soot.");
+							continue;
+						}
+
+						for(SootMethod sootMethod : sootClass.getMethods()) {
+
+							if (sootMethod.hasActiveBody()) {
+								System.out.println("\nsootMethod: " + sootMethod + "\n");
+
+								DirectedGraph<Unit> dg = icfg.getOrCreateUnitGraph(sootMethod);
+								System.out.println("Directed Graph:");
+								System.out.println(dg);
+							}
+
+						}
+					}
+				} else {
+					// Alternatively, try this
+					PackManager.v().getPack("wjtp").add(new Transform("wjtp.entrypoints", new SceneTransformer() {
+						@Override
+						protected void internalTransform(String s, Map<String, String> map) {
+							System.out.println("Using method 2");
+
+							JimpleBasedInterproceduralCFG icfg = new JimpleBasedInterproceduralCFG();
+							// BackwardsInterproceduralCFG backwardICFG = new BackwardsInterproceduralCFG(icfg);
+
+							for (SootMethod entry : Scene.v().getEntryPoints()) {
+								SootClass dummyClass = entry.getDeclaringClass();//Scene.v().getSootClassUnsafe("dummyMainClass");
+								if (!dummyClass.declaresMethodByName("main")) {
+									// Create the method, public static void main(String[])
+									SootMethod mainMethod = new SootMethod("main",
+											Arrays.asList(new Type[]{ArrayType.v(RefType.v("java.lang.String"), 1)}),
+											VoidType.v(), Modifier.PUBLIC | Modifier.STATIC);
+
+									//JimpleBody body = Jimple.v().newBody(mainMethod);
+									mainMethod.setActiveBody(entry.retrieveActiveBody());
+									dummyClass.addMethod(mainMethod);
+								}
+								dummyClass.setModifiers(Modifier.PUBLIC);
+								System.out.println("Entry:" + entry.toString());
+								for (SootMethod sootMethod : dummyClass.getMethods()) {
+									System.out.println("DummyClass Method: " + sootMethod.getSubSignature());
+									if (!sootMethod.getReturnType().equals(VoidType.v())) {
+										SootClass returnClass = Scene.v().getSootClass(sootMethod.getReturnType().toString());
+										System.out.println(returnClass.toString());
+										Set<Unit> calls = icfg.getCallsFromWithin(sootMethod);
+										for (Unit call : calls) {
+											System.out.println("Call: " + call);
+											Collection<SootMethod> callees = icfg.getCalleesOfCallAt(call);
+											for (SootMethod callee : callees) {
+												System.out.println("Callee: " + callee.getSubSignature());
+											}
+										}
+									}
+								}
+							}
+						}
+					}));
+					PackManager.v().getPack("wjtp").apply();
+				}
+
+				System.out.println("=============================================");
+				System.out.println("ANALYSIS COMPLETE!");
+			} // analyze each apk file
 		} catch (AbortAnalysisException e) {
 			// Silently return
 		} catch (ParseException e) {
@@ -377,7 +486,7 @@ public class MainClass {
 	 * Creates an instance of the FlowDroid data flow solver tool for Android.
 	 * Derived classes can override this method to inject custom variants of
 	 * FlowDroid.
-	 * 
+	 *
 	 * @param config The configuration object
 	 * @return An instance of the data flow solver
 	 */
@@ -387,7 +496,7 @@ public class MainClass {
 
 	/**
 	 * Initializes the taint wrapper based on the command-line parameters
-	 * 
+	 *
 	 * @param cmd The command-line parameters
 	 * @return The taint wrapper to use for the data flow analysis, or null in case
 	 *         no taint wrapper shall be used
@@ -417,98 +526,98 @@ public class MainClass {
 		ITaintPropagationWrapper result = null;
 		// Create the respective taint wrapper object
 		switch (taintWrapper.toLowerCase()) {
-		case "default":
-			// We use StubDroid, but with the summaries from inside the JAR
-			// files
-			result = createSummaryTaintWrapper(cmd, new LazySummaryProvider("summariesManual"));
-			break;
-		case "defaultfallback":
-			// We use StubDroid, but with the summaries from inside the JAR
-			// files
-			SummaryTaintWrapper summaryWrapper = createSummaryTaintWrapper(cmd,
-					new LazySummaryProvider("summariesManual"));
-			summaryWrapper.setFallbackTaintWrapper(EasyTaintWrapper.getDefault());
-			result = summaryWrapper;
-			break;
-		case "none":
-			break;
-		case "easy":
-			// If the user has not specified a definition file for the easy
-			// taint wrapper, we try to locate a default file
-			String defFile = null;
-			if (definitionFiles == null || definitionFiles.length == 0) {
-				File defaultFile = EasyTaintWrapper.locateDefaultDefinitionFile();
-				if (defaultFile == null) {
-					try {
-						return new EasyTaintWrapper(defFile);
-					} catch (Exception e) {
-						e.printStackTrace();
-						System.err.println(
-								"No definition file for the easy taint wrapper specified and could not find the default file");
-						throw new AbortAnalysisException();
-					}
-				} else
-					defFile = defaultFile.getCanonicalPath();
-			} else if (definitionFiles == null || definitionFiles.length != 1) {
-				System.err.println("Must specify exactly one definition file for the easy taint wrapper");
-				throw new AbortAnalysisException();
-			} else
-				defFile = definitionFiles[0];
-			result = new EasyTaintWrapper(defFile);
-			break;
-		case "stubdroid":
-			if (definitionFiles == null || definitionFiles.length == 0) {
-				System.err.println("Must specify at least one definition file for StubDroid");
-				throw new AbortAnalysisException();
-			}
-			result = TaintWrapperFactory.createTaintWrapper(Arrays.asList(definitionFiles));
-			break;
-		case "multi":
-			// We need explicit definition files
-			if (definitionFiles == null || definitionFiles.length == 0) {
-				System.err.println("Must explicitly specify the definition files for the multi mode");
-				throw new AbortAnalysisException();
-			}
-
-			// We need to group the definition files by their type
-			MultiMap<String, String> extensionToFile = new HashMultiMap<>(definitionFiles.length);
-			for (String str : definitionFiles) {
-				File f = new File(str);
-				if (f.isFile()) {
-					String fileName = f.getName();
-					extensionToFile.put(fileName.substring(fileName.lastIndexOf(".")), f.getCanonicalPath());
-				} else if (f.isDirectory()) {
-					extensionToFile.put(".xml", f.getCanonicalPath());
-				}
-			}
-
-			// For each definition file, we create the respective taint wrapper
-			TaintWrapperSet wrapperSet = new TaintWrapperSet();
-			SummaryTaintWrapper stubDroidWrapper = null;
-			if (extensionToFile.containsKey(".xml")) {
-				stubDroidWrapper = TaintWrapperFactory.createTaintWrapper(extensionToFile.get(".xml"));
-				wrapperSet.addWrapper(stubDroidWrapper);
-			}
-			Set<String> easyDefinitions = extensionToFile.get(".txt");
-			if (!easyDefinitions.isEmpty()) {
-				if (easyDefinitions.size() > 1) {
+			case "default":
+				// We use StubDroid, but with the summaries from inside the JAR
+				// files
+				result = createSummaryTaintWrapper(cmd, new LazySummaryProvider("summariesManual"));
+				break;
+			case "defaultfallback":
+				// We use StubDroid, but with the summaries from inside the JAR
+				// files
+				SummaryTaintWrapper summaryWrapper = createSummaryTaintWrapper(cmd,
+						new LazySummaryProvider("summariesManual"));
+				summaryWrapper.setFallbackTaintWrapper(EasyTaintWrapper.getDefault());
+				result = summaryWrapper;
+				break;
+			case "none":
+				break;
+			case "easy":
+				// If the user has not specified a definition file for the easy
+				// taint wrapper, we try to locate a default file
+				String defFile = null;
+				if (definitionFiles == null || definitionFiles.length == 0) {
+					File defaultFile = EasyTaintWrapper.locateDefaultDefinitionFile();
+					if (defaultFile == null) {
+						try {
+							return new EasyTaintWrapper(defFile);
+						} catch (Exception e) {
+							e.printStackTrace();
+							System.err.println(
+									"No definition file for the easy taint wrapper specified and could not find the default file");
+							throw new AbortAnalysisException();
+						}
+					} else
+						defFile = defaultFile.getCanonicalPath();
+				} else if (definitionFiles == null || definitionFiles.length != 1) {
 					System.err.println("Must specify exactly one definition file for the easy taint wrapper");
+					throw new AbortAnalysisException();
+				} else
+					defFile = definitionFiles[0];
+				result = new EasyTaintWrapper(defFile);
+				break;
+			case "stubdroid":
+				if (definitionFiles == null || definitionFiles.length == 0) {
+					System.err.println("Must specify at least one definition file for StubDroid");
+					throw new AbortAnalysisException();
+				}
+				result = TaintWrapperFactory.createTaintWrapper(Arrays.asList(definitionFiles));
+				break;
+			case "multi":
+				// We need explicit definition files
+				if (definitionFiles == null || definitionFiles.length == 0) {
+					System.err.println("Must explicitly specify the definition files for the multi mode");
 					throw new AbortAnalysisException();
 				}
 
-				// If we use StubDroid as well, we use the easy taint wrapper as
-				// a fallback
-				EasyTaintWrapper easyWrapper = new EasyTaintWrapper(easyDefinitions.iterator().next());
-				if (stubDroidWrapper == null)
-					wrapperSet.addWrapper(easyWrapper);
-				else
-					stubDroidWrapper.setFallbackTaintWrapper(easyWrapper);
-			}
-			result = wrapperSet;
-			break;
-		default:
-			System.err.println("Invalid taint propagation wrapper specified, ignoring.");
-			throw new AbortAnalysisException();
+				// We need to group the definition files by their type
+				MultiMap<String, String> extensionToFile = new HashMultiMap<>(definitionFiles.length);
+				for (String str : definitionFiles) {
+					File f = new File(str);
+					if (f.isFile()) {
+						String fileName = f.getName();
+						extensionToFile.put(fileName.substring(fileName.lastIndexOf(".")), f.getCanonicalPath());
+					} else if (f.isDirectory()) {
+						extensionToFile.put(".xml", f.getCanonicalPath());
+					}
+				}
+
+				// For each definition file, we create the respective taint wrapper
+				TaintWrapperSet wrapperSet = new TaintWrapperSet();
+				SummaryTaintWrapper stubDroidWrapper = null;
+				if (extensionToFile.containsKey(".xml")) {
+					stubDroidWrapper = TaintWrapperFactory.createTaintWrapper(extensionToFile.get(".xml"));
+					wrapperSet.addWrapper(stubDroidWrapper);
+				}
+				Set<String> easyDefinitions = extensionToFile.get(".txt");
+				if (!easyDefinitions.isEmpty()) {
+					if (easyDefinitions.size() > 1) {
+						System.err.println("Must specify exactly one definition file for the easy taint wrapper");
+						throw new AbortAnalysisException();
+					}
+
+					// If we use StubDroid as well, we use the easy taint wrapper as
+					// a fallback
+					EasyTaintWrapper easyWrapper = new EasyTaintWrapper(easyDefinitions.iterator().next());
+					if (stubDroidWrapper == null)
+						wrapperSet.addWrapper(easyWrapper);
+					else
+						stubDroidWrapper.setFallbackTaintWrapper(easyWrapper);
+				}
+				result = wrapperSet;
+				break;
+			default:
+				System.err.println("Invalid taint propagation wrapper specified, ignoring.");
+				throw new AbortAnalysisException();
 		}
 		return result;
 
@@ -689,11 +798,18 @@ public class MainClass {
 	/**
 	 * Parses the given command-line options and fills the given configuration
 	 * object accordingly
-	 * 
+	 *
 	 * @param cmd    The command line to parse
 	 * @param config The configuration object to fill
 	 */
 	private void parseCommandLineOptions(CommandLine cmd, InfoflowAndroidConfiguration config) {
+		// Preferred default modes
+		config.setCodeEliminationMode(CodeEliminationMode.NoCodeElimination);
+		config.setCallgraphAlgorithm(InfoflowConfiguration.CallgraphAlgorithm.CHA);
+		config.setImplicitFlowMode(ImplicitFlowMode.AllImplicitFlows);
+		config.setTaintAnalysisEnabled(false);
+		// config.setSootIntegrationMode(InfoflowAndroidConfiguration.SootIntegrationMode.CreateNewInstance);
+
 		// Files
 		{
 			String apkFile = cmd.getOptionValue(OPTION_APK_FILE);
@@ -913,7 +1029,7 @@ public class MainClass {
 
 	/**
 	 * Loads the data flow configuration from the given file
-	 * 
+	 *
 	 * @param configFile The configuration file from which to load the data flow
 	 *                   configuration
 	 * @return The loaded data flow configuration
@@ -927,6 +1043,20 @@ public class MainClass {
 			System.err.println("Could not parse configuration file: " + e.getMessage());
 			return null;
 		}
+	}
+
+	public String getPackageName(String apkPath) {
+		String packageName = "";
+		try {
+			try (ProcessManifest manifest = new ProcessManifest(apkPath)) {
+				packageName = manifest.getPackageName();
+			}
+		} catch (IOException e) {
+			e.printStackTrace();
+		} catch (XmlPullParserException e) {
+			e.printStackTrace();
+		}
+		return packageName;
 	}
 
 }
