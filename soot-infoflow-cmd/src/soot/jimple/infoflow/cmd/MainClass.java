@@ -1,10 +1,15 @@
 package soot.jimple.infoflow.cmd;
 
 import java.io.File;
+import java.io.FileWriter;
 import java.io.FilenameFilter;
 import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
 import org.apache.commons.cli.DefaultParser;
@@ -64,6 +69,7 @@ public class MainClass {
 	protected ReportMissingSummaryWrapper reportMissingSummaryWrapper;
 
 	protected Set<String> filesToSkip = new HashSet<>();
+	protected String appPackageName;
 
 	// Files
 	private static final String OPTION_CONFIG_FILE = "c";
@@ -357,28 +363,29 @@ public class MainClass {
 //				}
 
 				// Generate call graph
-				if (true){
-					System.out.println("Lets try generating the call graph...");
-					System.out.println("=============================================");
+				String apkPath = cmd.getOptionValue(OPTION_APK_FILE);
+				appPackageName = getPackageName(apkPath);
+				CallGraph cg;
 
-					analyzer = createFlowDroidInstance(config);
+				System.out.println("Lets try generating the call graph...");
+				System.out.println("=============================================");
 
-					analyzer.constructCallgraph();
+				analyzer = createFlowDroidInstance(config);
+				analyzer.constructCallgraph();
+				cg = Scene.v().getCallGraph();
 
-					CallGraph cg = Scene.v().getCallGraph();
+				System.out.println("Call graph has " + cg.size() + " edges");
 
-					System.out.println(cg);
-
-					// Iterate over the callgraph
-					if (false) {
-						for (Edge edge : cg) {
-							SootMethod smSrc = edge.src();
-							Unit uSrc = edge.srcStmt();
-							SootMethod smDest = edge.tgt();
-							System.out.println("Edge from " + uSrc + " in " + smSrc + " to " + smDest);
-						}
+				// Iterate over the callgraph
+				if (false) {
+					for (Edge edge : cg) {
+						SootMethod smSrc = edge.src();
+						Unit uSrc = edge.srcStmt();
+						SootMethod smDest = edge.tgt();
+						System.out.println("Edge from " + uSrc + " in " + smSrc + " to " + smDest);
 					}
-				}
+				} else
+					// System.out.println(cg);
 
 				// Generate the ICFG
 				System.out.println("Now, lets try generating the ICFG...");
@@ -387,8 +394,6 @@ public class MainClass {
 				if (true) {
 					System.out.println("Using method 1");
 					List<SootClass> validClasses = new ArrayList<>();
-					String apkPath = cmd.getOptionValue(OPTION_APK_FILE);
-					String appPackageName = getPackageName(apkPath);
 
 					for (SootClass sootClass : Scene.v().getApplicationClasses()) {
 						if (!sootClass.getName().contains(appPackageName))
@@ -412,13 +417,39 @@ public class MainClass {
 						}
 
 						for(SootMethod sootMethod : sootClass.getMethods()) {
+							System.out.println("\nsootMethod: " + sootMethod + "\n");
 
 							if (sootMethod.hasActiveBody()) {
-								System.out.println("\nsootMethod: " + sootMethod + "\n");
-
 								DirectedGraph<Unit> dg = icfg.getOrCreateUnitGraph(sootMethod);
 								System.out.println("Directed Graph:");
-								System.out.println(dg);
+								// System.out.println(dg);
+								Iterator<Unit> uit = dg.iterator();
+								while (uit.hasNext()) {
+									Unit u = uit.next();
+//									if (u.branches()) {
+//										System.out.println("Unit branches");
+//										System.out.println(u);
+//										List<Unit> list = icfg.getSuccsOf(u);
+//										System.out.println(list);
+//									}else if(icfg.isCallStmt(u)) {
+//										System.out.println("Call statement");
+//										System.out.println(u);
+//									}else if(icfg.isReturnSite(u)) {
+//										System.out.println("Return statement");
+//										System.out.println(u);
+//									} else {
+//										System.out.println(dg);
+//									}
+
+									if (icfg.isCallStmt(u)) {
+										System.out.println("Call statement");
+										System.out.println(u);
+									} else {
+										System.out.println("unit icfg has no call statement");
+									}
+								}
+							} else {
+								System.out.println("NO ACTIVE BODY");
 							}
 
 						}
@@ -468,6 +499,8 @@ public class MainClass {
 					PackManager.v().getPack("wjtp").apply();
 				}
 
+				saveOutputToFile(dumpCallGraph(cg), appPackageName);
+
 				System.out.println("=============================================");
 				System.out.println("ANALYSIS COMPLETE!");
 			} // analyze each apk file
@@ -478,6 +511,57 @@ public class MainClass {
 			return;
 		} catch (Exception e) {
 			System.err.println(String.format("The data flow analysis has failed. Error message: %s", e.getMessage()));
+			e.printStackTrace();
+		}
+	}
+
+	/**
+	 * output the call graph to JSON format
+	 * @param cg
+	 * @return String
+	 */
+	private String dumpCallGraph(CallGraph cg){
+		Iterator<Edge> itr = cg.iterator();
+		Map<String, Set<String>> map = new HashMap<String, Set<String>>();
+
+		while(itr.hasNext()){
+			Edge e = itr.next();
+			String srcSig = e.getSrc().toString();
+			String destSig = e.getTgt().toString();
+			Set<String> neighborSet;
+			if(map.containsKey(srcSig)){
+				neighborSet = map.get(srcSig);
+			}else{
+				neighborSet = new HashSet<String>();
+			}
+			neighborSet.add(destSig);
+			map.put(srcSig, neighborSet );
+
+		}
+
+		Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+		return gson.toJson(map);
+	}
+
+	/**
+	 *
+	 * @param output
+	 * @param packageName
+	 */
+	private void saveOutputToFile(String output, String packageName) {
+		String outputDir = System.getProperty("user.dir") + File.separator + "sootOutput";
+		Path outputPath = Paths.get(outputDir, "cfg-" + packageName + ".json");
+		File out = outputPath.toFile();
+
+		try {
+			if(out.exists()){
+				out.delete();
+			}
+			FileWriter fw = new FileWriter(out);
+			fw.write(output);
+			fw.flush();
+			fw.close();
+		} catch (IOException e) {
 			e.printStackTrace();
 		}
 	}
