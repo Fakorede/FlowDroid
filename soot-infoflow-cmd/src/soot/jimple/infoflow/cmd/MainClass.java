@@ -1,10 +1,18 @@
 package soot.jimple.infoflow.cmd;
 
 import java.io.File;
+import java.io.FileWriter;
 import java.io.FilenameFilter;
 import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
 import org.apache.commons.cli.DefaultParser;
@@ -43,8 +51,6 @@ import soot.jimple.infoflow.taintWrappers.ITaintPropagationWrapper;
 import soot.jimple.infoflow.taintWrappers.TaintWrapperSet;
 import soot.jimple.toolkits.callgraph.CallGraph;
 import soot.jimple.toolkits.callgraph.Edge;
-import soot.jimple.toolkits.ide.icfg.BackwardsInterproceduralCFG;
-import soot.jimple.toolkits.ide.icfg.JimpleBasedInterproceduralCFG;
 import soot.toolkits.graph.DirectedGraph;
 import soot.util.HashMultiMap;
 import soot.util.MultiMap;
@@ -64,6 +70,7 @@ public class MainClass {
 	protected ReportMissingSummaryWrapper reportMissingSummaryWrapper;
 
 	protected Set<String> filesToSkip = new HashSet<>();
+	protected String appPackageName;
 
 	// Files
 	private static final String OPTION_CONFIG_FILE = "c";
@@ -352,124 +359,137 @@ public class MainClass {
 					}
 				}
 
-//				if (config.getSootIntegrationMode() == InfoflowAndroidConfiguration.SootIntegrationMode.CreateNewInstance) {
-//					G.reset();
-//				}
+				G.reset();
+
+				// variables for disable alarm check
+				boolean passDisableAlarmCheck = false;
+				Map<String, Boolean> disableAlarmChecks = new HashMap<>();
+				disableAlarmChecks.put("hasCheckForCarConnectionType", false);
+				disableAlarmChecks.put("hasCallToCancel", false);
+				disableAlarmChecks.put("hasEdgeToAndroidAlarmManager", false);
+
+				// variables for stream alarm check
+				boolean passStreamAlarmCheck = false;
+				Map<String, Boolean> streamAlarmChecks = new HashMap<>();
+				streamAlarmChecks.put("hasCallToSetAudioStreamType", false);
+				streamAlarmChecks.put("hasEdgeToAndroidMediaPlayer", false);
+
 
 				// Generate call graph
-				if (true){
-					System.out.println("Lets try generating the call graph...");
-					System.out.println("=============================================");
+				String apkPath = cmd.getOptionValue(OPTION_APK_FILE);
+				appPackageName = getPackageName(apkPath);
+				CallGraph cg;
 
-					analyzer = createFlowDroidInstance(config);
+//				System.out.println("Lets try generating the call graph...");
+//				System.out.println("=============================================");
 
-					analyzer.constructCallgraph();
+				analyzer = createFlowDroidInstance(config);
+				analyzer.constructCallgraph();
+				cg = Scene.v().getCallGraph();
 
-					CallGraph cg = Scene.v().getCallGraph();
+				InfoflowCFG icfg = new InfoflowCFG();
 
-					System.out.println(cg);
+				for (Edge edge : cg) {
+					SootMethod smSrc = edge.src();
+					Unit uSrc = edge.srcStmt();
+					SootMethod smDest = edge.tgt();
 
-					// Iterate over the callgraph
-					if (false) {
-						for (Edge edge : cg) {
-							SootMethod smSrc = edge.src();
-							Unit uSrc = edge.srcStmt();
-							SootMethod smDest = edge.tgt();
-							System.out.println("Edge from " + uSrc + " in " + smSrc + " to " + smDest);
+					if (
+						smDest.toString().contains("void cancel") ||
+						smDest.toString().contains("void setAudioStreamType")
+					) {
+//						System.out.println("==========================");
+//						System.out.println("CURRENT EDGE: " + edge);
+//						System.out.println("==========================");
+//
+//						System.out.println("Edge from " + uSrc + " in " + smSrc + " to " + smDest);
+
+						if (!smSrc.hasActiveBody())
+							continue;
+
+						DirectedGraph<Unit> dg = icfg.getOrCreateUnitGraph(smSrc);
+
+//						System.out.println("DG SIZE");
+//						System.out.println(dg.size());
+
+
+						// Do a backward analysis over the dg
+						// Collect all units in a list
+						Iterator<Unit> uit = dg.iterator();
+						List<Unit> units = new ArrayList<>();
+
+						while (uit.hasNext()) {
+							units.add(uit.next());
 						}
+
+						// Iterate over the list in reverse order
+						ListIterator<Unit> revIterator = units.listIterator(units.size());
+
+						boolean containsCancelMethod = false;
+						boolean containsCarConnectionCheck = false;
+						boolean containsEdgeToAndroidAlarmManager = false;
+						boolean containsEdgeToAndroidMediaPlayer = false;
+						boolean containsCallToSetAudioStreamType = false;
+
+						while(revIterator.hasPrevious()) {
+							Unit u = revIterator.previous();
+
+							if (icfg.isCallStmt(u) && (u.toString().contains("void cancel") || u.toString().contains("void cancel(android.app.PendingIntent)")))
+								containsCancelMethod = true;
+
+							if (u.getClass().toString().equals("class soot.jimple.internal.JIfStmt") && u.toString().contains("i0 != 2"))
+								containsCarConnectionCheck = true;
+
+							if (icfg.isCallStmt(u) && u.toString().contains("android.app.AlarmManager: void cancel(android.app.PendingIntent)"))
+								containsEdgeToAndroidAlarmManager = true;
+
+							if (icfg.isCallStmt(u) && u.toString().contains("<android.media.MediaPlayer: void setAudioStreamType(int)>(4)"))
+								containsCallToSetAudioStreamType = true;
+
+							if (icfg.isCallStmt(u) && u.toString().contains("android.media.MediaPlayer: void setAudioStreamType(int)"))
+								containsEdgeToAndroidMediaPlayer = true;
+						}
+
+						if (!disableAlarmChecks.get("hasCallToCancel"))
+							disableAlarmChecks.put("hasCallToCancel", containsCancelMethod);
+
+						if (!disableAlarmChecks.get("hasCheckForCarConnectionType"))
+							disableAlarmChecks.put("hasCheckForCarConnectionType", containsCarConnectionCheck);
+
+						if (!disableAlarmChecks.get("hasEdgeToAndroidAlarmManager"))
+							disableAlarmChecks.put("hasEdgeToAndroidAlarmManager", containsEdgeToAndroidAlarmManager);
+
+						if (!streamAlarmChecks.get("hasCallToSetAudioStreamType"))
+							streamAlarmChecks.put("hasCallToSetAudioStreamType", containsCallToSetAudioStreamType);
+
+						if (!streamAlarmChecks.get("hasEdgeToAndroidMediaPlayer"))
+							streamAlarmChecks.put("hasEdgeToAndroidMediaPlayer", containsEdgeToAndroidMediaPlayer);
 					}
+				} // end iterate over cg edges
+
+				if (
+						Boolean.TRUE.equals(disableAlarmChecks.get("hasCallToCancel")) &&
+//						&& Boolean.TRUE.equals(disableAlarmChecks.get("hasCheckForCarConnectionType"))
+						Boolean.TRUE.equals(disableAlarmChecks.get("hasEdgeToAndroidAlarmManager"))
+				) {
+					passDisableAlarmCheck = true;
 				}
 
-				// Generate the ICFG
-				System.out.println("Now, lets try generating the ICFG...");
-				System.out.println("=============================================");
-
-				if (true) {
-					System.out.println("Using method 1");
-					List<SootClass> validClasses = new ArrayList<>();
-					String apkPath = cmd.getOptionValue(OPTION_APK_FILE);
-					String appPackageName = getPackageName(apkPath);
-
-					for (SootClass sootClass : Scene.v().getApplicationClasses()) {
-						if (!sootClass.getName().contains(appPackageName))
-							continue;
-						if (sootClass.getName().contains(appPackageName + ".R") || sootClass.getName().contains(appPackageName + ".BuildConfig"))
-							continue;
-						validClasses.add(sootClass);
-					}
-
-					System.out.println("Valid classes detected by Soot: " + validClasses.toArray().length);
-
-					InfoflowCFG icfg = new InfoflowCFG();
-					int classIndex = 0;
-
-					for (SootClass sootClass : validClasses) {
-						System.out.printf("*****Class %d: %s*****%n", ++classIndex, sootClass.getName());
-
-						if (sootClass.getMethods().isEmpty()) {
-							System.out.println("No methods detected by soot.");
-							continue;
-						}
-
-						for(SootMethod sootMethod : sootClass.getMethods()) {
-
-							if (sootMethod.hasActiveBody()) {
-								System.out.println("\nsootMethod: " + sootMethod + "\n");
-
-								DirectedGraph<Unit> dg = icfg.getOrCreateUnitGraph(sootMethod);
-								System.out.println("Directed Graph:");
-								System.out.println(dg);
-							}
-
-						}
-					}
-				} else {
-					// Alternatively, try this
-					PackManager.v().getPack("wjtp").add(new Transform("wjtp.entrypoints", new SceneTransformer() {
-						@Override
-						protected void internalTransform(String s, Map<String, String> map) {
-							System.out.println("Using method 2");
-
-							JimpleBasedInterproceduralCFG icfg = new JimpleBasedInterproceduralCFG();
-							// BackwardsInterproceduralCFG backwardICFG = new BackwardsInterproceduralCFG(icfg);
-
-							for (SootMethod entry : Scene.v().getEntryPoints()) {
-								SootClass dummyClass = entry.getDeclaringClass();//Scene.v().getSootClassUnsafe("dummyMainClass");
-								if (!dummyClass.declaresMethodByName("main")) {
-									// Create the method, public static void main(String[])
-									SootMethod mainMethod = new SootMethod("main",
-											Arrays.asList(new Type[]{ArrayType.v(RefType.v("java.lang.String"), 1)}),
-											VoidType.v(), Modifier.PUBLIC | Modifier.STATIC);
-
-									//JimpleBody body = Jimple.v().newBody(mainMethod);
-									mainMethod.setActiveBody(entry.retrieveActiveBody());
-									dummyClass.addMethod(mainMethod);
-								}
-								dummyClass.setModifiers(Modifier.PUBLIC);
-								System.out.println("Entry:" + entry.toString());
-								for (SootMethod sootMethod : dummyClass.getMethods()) {
-									System.out.println("DummyClass Method: " + sootMethod.getSubSignature());
-									if (!sootMethod.getReturnType().equals(VoidType.v())) {
-										SootClass returnClass = Scene.v().getSootClass(sootMethod.getReturnType().toString());
-										System.out.println(returnClass.toString());
-										Set<Unit> calls = icfg.getCallsFromWithin(sootMethod);
-										for (Unit call : calls) {
-											System.out.println("Call: " + call);
-											Collection<SootMethod> callees = icfg.getCalleesOfCallAt(call);
-											for (SootMethod callee : callees) {
-												System.out.println("Callee: " + callee.getSubSignature());
-											}
-										}
-									}
-								}
-							}
-						}
-					}));
-					PackManager.v().getPack("wjtp").apply();
+				if (
+						Boolean.TRUE.equals(streamAlarmChecks.get("hasCallToSetAudioStreamType")) &&
+						Boolean.TRUE.equals(streamAlarmChecks.get("hasEdgeToAndroidMediaPlayer"))
+				) {
+					passStreamAlarmCheck = true;
 				}
 
 				System.out.println("=============================================");
-				System.out.println("ANALYSIS COMPLETE!");
+				System.out.println("AUTODROID ANALYSIS RESULTS:");
+				System.out.println("=============================================");
+				System.out.println("Checks passed: {}" + " out of 2");
+				System.out.println("1. Does APK disable alarm? " + (passDisableAlarmCheck ? "✅" : "❌"));
+				System.out.println("2. Does APK implement STREAM_ALARM? " + (passStreamAlarmCheck  ? "✅" : "❌"));
+
+				// saveOutputToFile(dumpCallGraph(cg), appPackageName);
 			} // analyze each apk file
 		} catch (AbortAnalysisException e) {
 			// Silently return
@@ -478,6 +498,61 @@ public class MainClass {
 			return;
 		} catch (Exception e) {
 			System.err.println(String.format("The data flow analysis has failed. Error message: %s", e.getMessage()));
+			e.printStackTrace();
+		}
+	}
+
+	/**
+	 * output the call graph to JSON format
+	 * @param cg
+	 * @return String
+	 */
+	private String dumpCallGraph(CallGraph cg){
+		Iterator<Edge> itr = cg.iterator();
+		Map<String, Set<String>> map = new HashMap<String, Set<String>>();
+
+		while(itr.hasNext()){
+			Edge e = itr.next();
+			String srcSig = e.getSrc().toString();
+			String destSig = e.getTgt().toString();
+			Set<String> neighborSet;
+			if(map.containsKey(srcSig)){
+				neighborSet = map.get(srcSig);
+			}else{
+				neighborSet = new HashSet<String>();
+			}
+			neighborSet.add(destSig);
+			map.put(srcSig, neighborSet );
+
+		}
+
+		Gson gson = new GsonBuilder().disableHtmlEscaping().create();
+		return gson.toJson(map);
+	}
+
+	/**
+	 *
+	 * @param output
+	 * @param packageName
+	 */
+	private void saveOutputToFile(String output, String packageName) {
+		LocalDateTime now = LocalDateTime.now();
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
+        String timestamp = now.format(formatter);
+
+		String outputDir = System.getProperty("user.dir") + File.separator + "sootOutput";
+		Path outputPath = Paths.get(outputDir, "cfg-" + packageName + "-" + timestamp + ".json");
+		File out = outputPath.toFile();
+
+		try {
+			if(out.exists()){
+				out.delete();
+			}
+			FileWriter fw = new FileWriter(out);
+			fw.write(output);
+			fw.flush();
+			fw.close();
+		} catch (IOException e) {
 			e.printStackTrace();
 		}
 	}
