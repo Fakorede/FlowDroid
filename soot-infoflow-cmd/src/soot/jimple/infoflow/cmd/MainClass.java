@@ -270,6 +270,9 @@ public class MainClass {
 	}
 
 	protected void run(String[] args) throws Exception {
+		// Capture the start time
+		long startTime = System.currentTimeMillis();
+
 		// We need proper parameters
 		final HelpFormatter formatter = new HelpFormatter();
 		if (args.length == 0) {
@@ -490,6 +493,19 @@ public class MainClass {
 				System.out.println("2. Does APK implement STREAM_ALARM? " + (passStreamAlarmCheck  ? "✅" : "❌"));
 
 				// saveOutputToFile(dumpCallGraph(cg), appPackageName);
+
+				// Capture the end time
+				long endTime = System.currentTimeMillis();
+
+				long elapsedTime = endTime - startTime;
+				long elapsedSeconds = elapsedTime / 1000;
+				long minutes = elapsedSeconds / 60;
+				long seconds = elapsedSeconds % 60;
+				long hours = minutes / 60;
+				minutes = minutes % 60;
+
+				// Print the elapsed time in hours, minutes, and seconds
+				System.out.printf("Execution time: %02d hours %02d minutes %02d seconds%n", hours, minutes, seconds);
 			} // analyze each apk file
 		} catch (AbortAnalysisException e) {
 			// Silently return
