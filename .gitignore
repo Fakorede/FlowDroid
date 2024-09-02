@@ -10,3 +10,7 @@ target/
 .settings
 **/*.project
 **/*.classpath
+
+android-app-category.csv
+apk-analyzer.py
+apk-parser.py

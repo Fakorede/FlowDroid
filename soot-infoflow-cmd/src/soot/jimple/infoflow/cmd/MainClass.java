@@ -1,15 +1,19 @@
 package soot.jimple.infoflow.cmd;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.FilenameFilter;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -52,6 +56,7 @@ import soot.jimple.infoflow.taintWrappers.TaintWrapperSet;
 import soot.jimple.toolkits.callgraph.CallGraph;
 import soot.jimple.toolkits.callgraph.Edge;
 import soot.toolkits.graph.DirectedGraph;
+import soot.util.Chain;
 import soot.util.HashMultiMap;
 import soot.util.MultiMap;
 
@@ -71,6 +76,7 @@ public class MainClass {
 
 	protected Set<String> filesToSkip = new HashSet<>();
 	protected String appPackageName;
+	protected String serviceName;
 
 	// Files
 	private static final String OPTION_CONFIG_FILE = "c";
@@ -142,6 +148,8 @@ public class MainClass {
 	// Callgraph analysis
 	private static final String OPTION_CALLGRAPH_FILE = "cf";
 	private static final String OPTION_CALLGRAPH_ONLY = "x";
+
+	private static final String OPTION_ANDROID_AUTO_CATEGORY = "cat";
 
 	protected MainClass() {
 		initializeCommandLineOptions();
@@ -262,11 +270,51 @@ public class MainClass {
 		options.addOption(OPTION_CALLGRAPH_FILE, "callgraphdir", true,
 				"The file in which to store and from which to read serialized callgraphs");
 		options.addOption(OPTION_CALLGRAPH_ONLY, "callgraphonly", false, "Only compute the callgraph and terminate");
+
+		options.addOption(OPTION_ANDROID_AUTO_CATEGORY, "appCategory", true, "Specify the app category of the apk to be analyzed (MEDIA, MESSAGING, NAVIGATION, POI)");
 	}
 
 	public static void main(String[] args) throws Exception {
 		MainClass main = new MainClass();
 		main.run(args);
+	}
+
+	protected StringBuilder runScript(String apkPath) throws Exception {
+		try {
+			String[] command = {"python3", "apk-analyzer.py", apkPath};
+
+			Process process = Runtime.getRuntime().exec(command);
+
+			// Capture the output of the Python script
+			BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+			String line;
+			StringBuilder output = new StringBuilder();
+			Pattern pattern = Pattern.compile("MediaService:\\s*(.*)");
+
+			while ((line = reader.readLine()) != null) {
+				// Check if the line contains "MediaService:" and capture what comes after
+                Matcher matcher = pattern.matcher(line);
+                if (matcher.find())
+                    this.serviceName = matcher.group(1);
+				else
+					output.append(line).append("\n");
+			}
+
+			// Capture any errors
+			BufferedReader errorReader = new BufferedReader(new InputStreamReader(process.getErrorStream()));
+			while ((line = errorReader.readLine()) != null) {
+				// System.err.println(line);
+			}
+
+			// Wait for the process to complete
+            int exitCode = process.waitFor();
+            System.out.println("Script exited with code: " + exitCode);
+
+			return output;
+		} catch (Exception e) {
+            e.printStackTrace();
+			return null;
+        }
 	}
 
 	protected void run(String[] args) throws Exception {
@@ -362,7 +410,73 @@ public class MainClass {
 					}
 				}
 
+				// AndroidManifest Analysis
+				StringBuilder scriptResult = this.runScript(config.getAnalysisFileConfig().getTargetAPKFile());
+
 				G.reset();
+
+				String appCategory = cmd.getOptionValue(OPTION_ANDROID_AUTO_CATEGORY);
+				String apkPath = cmd.getOptionValue(OPTION_APK_FILE);
+				appPackageName = getPackageName(apkPath);
+
+				analyzer = createFlowDroidInstance(config);
+				analyzer.constructCallgraph();
+
+				// MEDIA UI Callbacks
+				Chain<SootClass> classes = Scene.v().getClasses();
+				boolean containsOnCreate = false;
+				boolean containsOnGetRoot = false;
+				boolean containsOnLoadChildren = false;
+				for (SootClass className: classes) {
+					if (className.toString().equals(this.serviceName)) {
+						for (SootMethod method: className.getMethods()) {
+							if (method.toString().contains("void onCreate()"))
+								containsOnCreate = true;
+							if (method.toString().contains("androidx.media.MediaBrowserServiceCompat$BrowserRoot onGetRoot(java.lang.String,int,android.os.Bundle)"))
+								containsOnGetRoot = true;
+							if (method.toString().contains("void onLoadChildren(java.lang.String,androidx.media.MediaBrowserServiceCompat$Result)"))
+								containsOnLoadChildren = true;
+							if (containsOnCreate && containsOnGetRoot && containsOnLoadChildren)
+								break;	
+						}
+					}
+				}
+
+				// MEDIA Play Callbacks
+				boolean containsOnPlay = false;
+				boolean containsOnStop = false;
+				boolean containsOnPrepare = false;
+				boolean containsOnPause = false;
+				boolean containsOnPlayFromMediaId = false;
+				boolean containsOnPlayFromSearch = false;
+				boolean containsOnSkipToNext = false;
+				boolean containsOnSkipToPrevious = false;
+
+				SootClass mediaCallbackClass = Scene.v().getSootClass("android.support.v4.media.session.MediaSessionCompat$Callback");
+
+				Set<SootClass> subclasses = findSubClasses(mediaCallbackClass);
+
+				for (SootClass subclass : subclasses) {
+					if (!containsOnPrepare)
+						containsOnPrepare = methodExistsInClass(subclass, "onPrepare", "void onPrepare()");
+					if (!containsOnPause)
+						containsOnPause = methodExistsInClass(subclass, "onPause", "void onPause()");
+					if (!containsOnPlay)
+						containsOnPlay = methodExistsInClass(subclass, "onPlay", "void onPlay()");
+					if (!containsOnStop)
+						containsOnStop = methodExistsInClass(subclass, "onStop", "void onStop()");
+					if (!containsOnSkipToNext)
+						containsOnSkipToNext = methodExistsInClass(subclass, "onSkipToNext", "void onSkipToNext()");
+					if (!containsOnSkipToPrevious)
+						containsOnSkipToPrevious = methodExistsInClass(subclass, "onSkipToPrevious", "void onSkipToPrevious()");
+					if (!containsOnPlayFromSearch)
+						containsOnPlayFromSearch = methodExistsInClass(subclass, "onPlayFromSearch", "void onPlayFromSearch(java.lang.String,android.os.Bundle)");
+					if (!containsOnPlayFromMediaId)
+						containsOnPlayFromMediaId = methodExistsInClass(subclass, "onPlayFromMediaId", "void onPlayFromMediaId(java.lang.String,android.os.Bundle)");
+				}
+
+				CallGraph cg = Scene.v().getCallGraph();
+				InfoflowCFG icfg = new InfoflowCFG();
 
 				// variables for disable alarm check
 				boolean passDisableAlarmCheck = false;
@@ -377,26 +491,12 @@ public class MainClass {
 				streamAlarmChecks.put("hasCallToSetAudioStreamType", false);
 				streamAlarmChecks.put("hasEdgeToAndroidMediaPlayer", false);
 
-
-				// Generate call graph
-				String apkPath = cmd.getOptionValue(OPTION_APK_FILE);
-				appPackageName = getPackageName(apkPath);
-				CallGraph cg;
-
-//				System.out.println("Lets try generating the call graph...");
-//				System.out.println("=============================================");
-
-				analyzer = createFlowDroidInstance(config);
-				analyzer.constructCallgraph();
-				cg = Scene.v().getCallGraph();
-
-				InfoflowCFG icfg = new InfoflowCFG();
-
 				for (Edge edge : cg) {
 					SootMethod smSrc = edge.src();
 					Unit uSrc = edge.srcStmt();
 					SootMethod smDest = edge.tgt();
 
+					// DISABLE ALARMS
 					if (
 						smDest.toString().contains("void cancel") ||
 						smDest.toString().contains("void setAudioStreamType")
@@ -437,6 +537,8 @@ public class MainClass {
 						while(revIterator.hasPrevious()) {
 							Unit u = revIterator.previous();
 
+							// if (u.getClass().toString().equals("class soot.jimple.internal.JIfStmt")
+
 							if (icfg.isCallStmt(u) && (u.toString().contains("void cancel") || u.toString().contains("void cancel(android.app.PendingIntent)")))
 								containsCancelMethod = true;
 
@@ -470,27 +572,93 @@ public class MainClass {
 					}
 				} // end iterate over cg edges
 
-				if (
+
+				// RESULTS
+				System.out.println("=============================================");
+				System.out.println("MANIFEST CHECKS:");
+				System.out.println("=============================================");
+				System.out.println(scriptResult);
+
+				if (appCategory != null && appCategory.equalsIgnoreCase("MEDIA")) {
+					System.out.println("=============================================");
+					System.out.println("MEDIA CHECKS:");
+					System.out.println("=============================================");
+					if (containsOnCreate)
+						System.out.println("✅ APK implements onCreate() method.");
+					else
+						System.out.println("❌ APK does NOT implement onCreate() method. See https://developer.android.com/training/cars/media#browser_workflow");
+					if (containsOnGetRoot)
+						System.out.println("✅ APK implements onGetRoot() method.");
+					else
+						System.out.println("❌ APK does NOT implement onGetRoot() method. See https://developer.android.com/training/cars/media#onGetRoot");
+					if (containsOnLoadChildren)
+						System.out.println("✅ APK implements onLoadChildren() method.");
+					else
+						System.out.println("❌ APK does NOT implement onLoadChildren() method. See https://developer.android.com/training/cars/media#onLoadChildren");
+
+
+					System.out.println("=============================================");
+					System.out.println("MEDIA PLAY CALLBACKS CHECK:");
+					System.out.println("=============================================");
+					if (containsOnPlay)
+						System.out.println("✅ APK implements onPlay() method.");
+					else
+						System.out.println("❌ APK does NOT implement onPlay() method. See https://developer.android.com/training/cars/media#playback-commands");
+					if (containsOnPause)
+						System.out.println("✅ APK implements onPause() method.");
+					else
+						System.out.println("❌ APK does NOT implement onPause() method. See https://developer.android.com/training/cars/media#playback-commands");
+					if (containsOnPrepare)
+						System.out.println("✅ APK implements onPrepare() method.");
+					else
+						System.out.println("❌ APK does NOT implement onPrepare() method. See https://developer.android.com/training/cars/media#playback-commands");
+					if (containsOnStop)
+						System.out.println("✅ APK implements onStop() method.");
+					else
+						System.out.println("❌ APK does NOT implement onStop() method. See https://developer.android.com/training/cars/media#playback-commands");
+					if (containsOnSkipToNext)
+						System.out.println("✅ APK implements onSkipToNext() method.");
+					else
+						System.out.println("❌ APK does NOT implement onSkipToNext() method. See https://developer.android.com/training/cars/media#playback-commands");
+					if (containsOnSkipToPrevious)
+						System.out.println("✅ APK implements onSkipToPrevious() method.");
+					else
+						System.out.println("❌ APK does NOT implement onSkipToPrevious() method. See https://developer.android.com/training/cars/media#playback-commands");
+					if (containsOnPlayFromSearch)
+						System.out.println("✅ APK implements onPlayFromSearch() method.");
+					else
+						System.out.println("❌ APK does NOT implement onPlayFromSearch() method. See https://developer.android.com/training/cars/media#playback-commands");
+					if (containsOnPlayFromMediaId)
+						System.out.println("✅ APK implements onPlayFromMediaId() method.");
+					else
+						System.out.println("❌ APK does NOT implement onPlayFromMediaId() method. See https://developer.android.com/training/cars/media#playback-commands");
+	
+
+					System.out.println("=============================================");
+					System.out.println("DISTRACTION SAFEGUARDS:");
+					System.out.println("=============================================");
+					if (
 						Boolean.TRUE.equals(disableAlarmChecks.get("hasCallToCancel")) &&
 //						&& Boolean.TRUE.equals(disableAlarmChecks.get("hasCheckForCarConnectionType"))
 						Boolean.TRUE.equals(disableAlarmChecks.get("hasEdgeToAndroidAlarmManager"))
-				) {
-					passDisableAlarmCheck = true;
-				}
+					) passDisableAlarmCheck = true;
 
-				if (
+					if (
 						Boolean.TRUE.equals(streamAlarmChecks.get("hasCallToSetAudioStreamType")) &&
 						Boolean.TRUE.equals(streamAlarmChecks.get("hasEdgeToAndroidMediaPlayer"))
-				) {
-					passStreamAlarmCheck = true;
+					) passStreamAlarmCheck = true;
+
+					if (passDisableAlarmCheck) 
+						System.out.println("✅ APK disables alarm.");
+					else
+						System.out.println("❌ APK does NOT disable alarm. See https://developer.android.com/training/cars/media#alarm");
+
+					if (passStreamAlarmCheck) 
+						System.out.println("✅ APK implements STREAM_ALARM.");
+					else
+						System.out.println("❌ APK does NOT implement STREAM_ALARM. See https://developer.android.com/training/cars/media#alarm");
 				}
 
-				System.out.println("=============================================");
-				System.out.println("AUTODROID ANALYSIS RESULTS:");
-				System.out.println("=============================================");
-				System.out.println("Checks passed: {}" + " out of 2");
-				System.out.println("1. Does APK disable alarm? " + (passDisableAlarmCheck ? "✅" : "❌"));
-				System.out.println("2. Does APK implement STREAM_ALARM? " + (passStreamAlarmCheck  ? "✅" : "❌"));
 
 				// saveOutputToFile(dumpCallGraph(cg), appPackageName);
 
@@ -505,8 +673,9 @@ public class MainClass {
 				minutes = minutes % 60;
 
 				// Print the elapsed time in hours, minutes, and seconds
-				System.out.printf("Execution time: %02d hours %02d minutes %02d seconds%n", hours, minutes, seconds);
+				System.out.printf("Execution time: %d - %02d hours %02d minutes %02d seconds\n", elapsedSeconds, hours, minutes, seconds);
 			} // analyze each apk file
+		
 		} catch (AbortAnalysisException e) {
 			// Silently return
 		} catch (ParseException e) {
@@ -572,6 +741,49 @@ public class MainClass {
 			e.printStackTrace();
 		}
 	}
+
+	/**
+     * Finds all subclasses of the specified class.
+     * 
+     * @param sootClass The class whose subclasses are to be found.
+     * @return a list of subclasses extending the specified class
+     */
+	private Set<SootClass> findSubClasses(SootClass superClass) {
+        Set<SootClass> subclasses = new HashSet<>();
+
+        for (SootClass sootClass : Scene.v().getClasses()) {
+            if (sootClass.hasSuperclass() && sootClass.getSuperclass().equals(superClass)) {
+                String className = sootClass.getName();
+                if (!className.startsWith("android.support.v4.media.session.MediaSessionCompat")) {
+                    subclasses.add(sootClass);
+                }
+            }
+        }
+
+        return subclasses;
+    }
+
+	/**
+     * Checks if a method with the specified name and signature exists in the given class.
+     *
+     * @param sootClass      The class to search in.
+     * @param methodName     The name of the method to search for.
+     * @param methodSignature The signature of the method to search for.
+     * @return True if the method exists, false otherwise.
+     */
+    private boolean methodExistsInClass(SootClass sootClass, String methodName, String methodSignature) {
+        // Iterate over all methods in the class
+        for (SootMethod method : sootClass.getMethods()) {
+            // Check if the method name matches
+            if (method.getName().equals(methodName)) {
+                // Check if the method signature matches
+                if (method.getSignature().contains(methodSignature)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
 
 	/**
 	 * Creates an instance of the FlowDroid data flow solver tool for Android.
