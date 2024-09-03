@@ -1,18 +1,27 @@
 package soot.jimple.infoflow.cmd;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.FilenameFilter;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+
+import checkers.AutoCategoryChecker;
+import checkers.AutoCategoryCheckerFactory;
+import checkers.MediaChecker;
+
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
 import org.apache.commons.cli.DefaultParser;
@@ -52,6 +61,7 @@ import soot.jimple.infoflow.taintWrappers.TaintWrapperSet;
 import soot.jimple.toolkits.callgraph.CallGraph;
 import soot.jimple.toolkits.callgraph.Edge;
 import soot.toolkits.graph.DirectedGraph;
+import soot.util.Chain;
 import soot.util.HashMultiMap;
 import soot.util.MultiMap;
 
@@ -71,6 +81,7 @@ public class MainClass {
 
 	protected Set<String> filesToSkip = new HashSet<>();
 	protected String appPackageName;
+	protected String serviceName;
 
 	// Files
 	private static final String OPTION_CONFIG_FILE = "c";
@@ -142,6 +153,8 @@ public class MainClass {
 	// Callgraph analysis
 	private static final String OPTION_CALLGRAPH_FILE = "cf";
 	private static final String OPTION_CALLGRAPH_ONLY = "x";
+
+	private static final String OPTION_ANDROID_AUTO_CATEGORY = "cat";
 
 	protected MainClass() {
 		initializeCommandLineOptions();
@@ -262,11 +275,51 @@ public class MainClass {
 		options.addOption(OPTION_CALLGRAPH_FILE, "callgraphdir", true,
 				"The file in which to store and from which to read serialized callgraphs");
 		options.addOption(OPTION_CALLGRAPH_ONLY, "callgraphonly", false, "Only compute the callgraph and terminate");
+
+		options.addOption(OPTION_ANDROID_AUTO_CATEGORY, "appCategory", true, "Specify the app category of the apk to be analyzed (MEDIA, MESSAGING, NAVIGATION, POI)");
 	}
 
 	public static void main(String[] args) throws Exception {
 		MainClass main = new MainClass();
 		main.run(args);
+	}
+
+	protected StringBuilder runScript(String apkPath, String category) throws Exception {
+		try {
+			String[] command = {"python3", "apk-analyzer.py", apkPath, category};
+
+			Process process = Runtime.getRuntime().exec(command);
+
+			// Capture the output of the Python script
+			BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+			String line;
+			StringBuilder output = new StringBuilder();
+			Pattern pattern = Pattern.compile("MediaService:\\s*(.*)");
+
+			while ((line = reader.readLine()) != null) {
+				// Check if the line contains "MediaService:" and capture what comes after
+                Matcher matcher = pattern.matcher(line);
+                if (matcher.find())
+                    this.serviceName = matcher.group(1);
+				else
+					output.append(line).append("\n");
+			}
+
+			// Capture any errors
+			BufferedReader errorReader = new BufferedReader(new InputStreamReader(process.getErrorStream()));
+			while ((line = errorReader.readLine()) != null) {
+				// System.err.println(line);
+			}
+
+			// Wait for the process to complete
+            int exitCode = process.waitFor();
+            System.out.println("Script exited with code: " + exitCode);
+
+			return output;
+		} catch (Exception e) {
+            e.printStackTrace();
+			return null;
+        }
 	}
 
 	protected void run(String[] args) throws Exception {
@@ -362,135 +415,30 @@ public class MainClass {
 					}
 				}
 
-				G.reset();
-
-				// variables for disable alarm check
-				boolean passDisableAlarmCheck = false;
-				Map<String, Boolean> disableAlarmChecks = new HashMap<>();
-				disableAlarmChecks.put("hasCheckForCarConnectionType", false);
-				disableAlarmChecks.put("hasCallToCancel", false);
-				disableAlarmChecks.put("hasEdgeToAndroidAlarmManager", false);
-
-				// variables for stream alarm check
-				boolean passStreamAlarmCheck = false;
-				Map<String, Boolean> streamAlarmChecks = new HashMap<>();
-				streamAlarmChecks.put("hasCallToSetAudioStreamType", false);
-				streamAlarmChecks.put("hasEdgeToAndroidMediaPlayer", false);
-
-
-				// Generate call graph
+				String appCategory = cmd.getOptionValue(OPTION_ANDROID_AUTO_CATEGORY);
 				String apkPath = cmd.getOptionValue(OPTION_APK_FILE);
 				appPackageName = getPackageName(apkPath);
-				CallGraph cg;
 
-//				System.out.println("Lets try generating the call graph...");
-//				System.out.println("=============================================");
+				if (appCategory == null) {
+					throw new IllegalArgumentException("Android Auto category is required but was not provided.");
+				}
+
+				// AndroidManifest Analysis // config.getAnalysisFileConfig().getTargetAPKFile()
+				StringBuilder scriptResult = this.runScript(apkPath, appCategory);
+
+				G.reset();
 
 				analyzer = createFlowDroidInstance(config);
 				analyzer.constructCallgraph();
-				cg = Scene.v().getCallGraph();
 
-				InfoflowCFG icfg = new InfoflowCFG();
-
-				for (Edge edge : cg) {
-					SootMethod smSrc = edge.src();
-					Unit uSrc = edge.srcStmt();
-					SootMethod smDest = edge.tgt();
-
-					if (
-						smDest.toString().contains("void cancel") ||
-						smDest.toString().contains("void setAudioStreamType")
-					) {
-//						System.out.println("==========================");
-//						System.out.println("CURRENT EDGE: " + edge);
-//						System.out.println("==========================");
-//
-//						System.out.println("Edge from " + uSrc + " in " + smSrc + " to " + smDest);
-
-						if (!smSrc.hasActiveBody())
-							continue;
-
-						DirectedGraph<Unit> dg = icfg.getOrCreateUnitGraph(smSrc);
-
-//						System.out.println("DG SIZE");
-//						System.out.println(dg.size());
-
-
-						// Do a backward analysis over the dg
-						// Collect all units in a list
-						Iterator<Unit> uit = dg.iterator();
-						List<Unit> units = new ArrayList<>();
-
-						while (uit.hasNext()) {
-							units.add(uit.next());
-						}
-
-						// Iterate over the list in reverse order
-						ListIterator<Unit> revIterator = units.listIterator(units.size());
-
-						boolean containsCancelMethod = false;
-						boolean containsCarConnectionCheck = false;
-						boolean containsEdgeToAndroidAlarmManager = false;
-						boolean containsEdgeToAndroidMediaPlayer = false;
-						boolean containsCallToSetAudioStreamType = false;
-
-						while(revIterator.hasPrevious()) {
-							Unit u = revIterator.previous();
-
-							if (icfg.isCallStmt(u) && (u.toString().contains("void cancel") || u.toString().contains("void cancel(android.app.PendingIntent)")))
-								containsCancelMethod = true;
-
-							if (u.getClass().toString().equals("class soot.jimple.internal.JIfStmt") && u.toString().contains("i0 != 2"))
-								containsCarConnectionCheck = true;
-
-							if (icfg.isCallStmt(u) && u.toString().contains("android.app.AlarmManager: void cancel(android.app.PendingIntent)"))
-								containsEdgeToAndroidAlarmManager = true;
-
-							if (icfg.isCallStmt(u) && u.toString().contains("<android.media.MediaPlayer: void setAudioStreamType(int)>(4)"))
-								containsCallToSetAudioStreamType = true;
-
-							if (icfg.isCallStmt(u) && u.toString().contains("android.media.MediaPlayer: void setAudioStreamType(int)"))
-								containsEdgeToAndroidMediaPlayer = true;
-						}
-
-						if (!disableAlarmChecks.get("hasCallToCancel"))
-							disableAlarmChecks.put("hasCallToCancel", containsCancelMethod);
-
-						if (!disableAlarmChecks.get("hasCheckForCarConnectionType"))
-							disableAlarmChecks.put("hasCheckForCarConnectionType", containsCarConnectionCheck);
-
-						if (!disableAlarmChecks.get("hasEdgeToAndroidAlarmManager"))
-							disableAlarmChecks.put("hasEdgeToAndroidAlarmManager", containsEdgeToAndroidAlarmManager);
-
-						if (!streamAlarmChecks.get("hasCallToSetAudioStreamType"))
-							streamAlarmChecks.put("hasCallToSetAudioStreamType", containsCallToSetAudioStreamType);
-
-						if (!streamAlarmChecks.get("hasEdgeToAndroidMediaPlayer"))
-							streamAlarmChecks.put("hasEdgeToAndroidMediaPlayer", containsEdgeToAndroidMediaPlayer);
-					}
-				} // end iterate over cg edges
-
-				if (
-						Boolean.TRUE.equals(disableAlarmChecks.get("hasCallToCancel")) &&
-//						&& Boolean.TRUE.equals(disableAlarmChecks.get("hasCheckForCarConnectionType"))
-						Boolean.TRUE.equals(disableAlarmChecks.get("hasEdgeToAndroidAlarmManager"))
-				) {
-					passDisableAlarmCheck = true;
-				}
-
-				if (
-						Boolean.TRUE.equals(streamAlarmChecks.get("hasCallToSetAudioStreamType")) &&
-						Boolean.TRUE.equals(streamAlarmChecks.get("hasEdgeToAndroidMediaPlayer"))
-				) {
-					passStreamAlarmCheck = true;
-				}
-
+				// RESULTS
 				System.out.println("=============================================");
-				System.out.println("AUTODROID ANALYSIS RESULTS:");
+				System.out.println("MANIFEST CHECKS:");
 				System.out.println("=============================================");
-				System.out.println("Checks passed: {}" + " out of 2");
-				System.out.println("1. Does APK disable alarm? " + (passDisableAlarmCheck ? "✅" : "❌"));
-				System.out.println("2. Does APK implement STREAM_ALARM? " + (passStreamAlarmCheck  ? "✅" : "❌"));
+				System.out.println(scriptResult);
+
+				AutoCategoryChecker autoChecker = AutoCategoryCheckerFactory.getCheck(appCategory, this.serviceName);
+				autoChecker.performChecks();
 
 				// saveOutputToFile(dumpCallGraph(cg), appPackageName);
 
@@ -505,8 +453,9 @@ public class MainClass {
 				minutes = minutes % 60;
 
 				// Print the elapsed time in hours, minutes, and seconds
-				System.out.printf("Execution time: %02d hours %02d minutes %02d seconds%n", hours, minutes, seconds);
+				System.out.printf("Execution time: %d - %02d hours %02d minutes %02d seconds\n", elapsedSeconds, hours, minutes, seconds);
 			} // analyze each apk file
+		
 		} catch (AbortAnalysisException e) {
 			// Silently return
 		} catch (ParseException e) {
